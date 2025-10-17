@@ -1,65 +1,45 @@
 import os
+import telebot
 import subprocess
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from telebot import types
 
-BOT_TOKEN = os.getenv("8458485625:AAE7d2CDx4mi_RzpyhNmMdY0vT7IfJCkKLY")
-WORKDIR = "/app/workdir"
-REMOTE_NAME = "gdrive"
-UPLOAD_FOLDER = "FFmpegConverted"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+bot = telebot.TeleBot(BOT_TOKEN)
 
-os.makedirs(WORKDIR, exist_ok=True)
-
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text("🎬 Send me a video file. I'll convert it for TACTV STB and upload to Google Drive.")
-
-def handle_video(update: Update, context: CallbackContext):
-    msg = update.message
-    file_obj = msg.video or msg.document
-    if not file_obj:
-        msg.reply_text("❌ Please send a video file.")
-        return
-
-    file_id = file_obj.file_id
-    in_name = os.path.join(WORKDIR, f"in_{file_id}.mkv")
-    out_name = os.path.join(WORKDIR, f"out_{file_id}.mpg")
-
-    msg.reply_text("⬇️ Downloading file...")
-    file_obj.get_file().download(custom_path=in_name)
-
-    msg.reply_text("⚙️ Converting to MPEG2 format (TACTV spec)...")
-    ff_cmd = [
-        "ffmpeg", "-y", "-i", in_name,
+def convert_video(input_file):
+    output_file = input_file.rsplit('.', 1)[0] + "_Converted.mpg"
+    cmd = [
+        "ffmpeg", "-i", input_file,
         "-c:v", "mpeg2video", "-b:v", "6000k", "-maxrate", "9000k", "-bufsize", "1835k",
         "-vf", "scale=720:576,format=yuv420p,setsar=12/11",
         "-r", "25", "-top", "1", "-flags", "+ildct+ilme", "-aspect", "4:3",
         "-c:a", "mp2", "-b:a", "192k", "-ar", "48000",
-        out_name
+        output_file
     ]
-    proc = subprocess.run(ff_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if proc.returncode != 0:
-        msg.reply_text("❌ FFmpeg failed:\n" + proc.stderr[-500:])
-        return
+    subprocess.run(cmd, check=True)
+    return output_file
 
-    msg.reply_text("✅ Conversion done! Uploading to Google Drive...")
+def upload_to_gdrive(file_path):
+    subprocess.run(["rclone", "copy", file_path, "gdrive:/ConvertedVideos", "--drive-chunk-size", "64M", "-P"])
+    link = subprocess.check_output(["rclone", "link", f"gdrive:/ConvertedVideos/{os.path.basename(file_path)}"]).decode().strip()
+    return link
 
-    subprocess.run(["rclone", "mkdir", f"{REMOTE_NAME}:{UPLOAD_FOLDER}"])
-    upload_path = f"{REMOTE_NAME}:{UPLOAD_FOLDER}/{os.path.basename(out_name)}"
-    subprocess.run(["rclone", "copyto", out_name, upload_path, "--progress"])
-    share_link = subprocess.check_output(["rclone", "link", upload_path], text=True).strip()
+@bot.message_handler(content_types=['video'])
+def handle_video(message):
+    msg = bot.reply_to(message, "🎬 Downloading video...")
+    file_info = bot.get_file(message.video.file_id)
+    downloaded_file = bot.download_file(file_info.file_path)
 
-    msg.reply_text(f"📤 Uploaded Successfully!\n🔗 {share_link}")
+    input_filename = message.video.file_name or "input.mp4"
+    with open(input_filename, 'wb') as f:
+        f.write(downloaded_file)
 
-    os.remove(in_name)
-    os.remove(out_name)
+    bot.edit_message_text("⚙️ Converting video, please wait...", chat_id=msg.chat.id, message_id=msg.message_id)
+    output_file = convert_video(input_filename)
 
-def main():
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(MessageHandler(Filters.video | Filters.document, handle_video))
-    updater.start_polling()
-    updater.idle()
+    bot.edit_message_text("☁️ Uploading to Google Drive...", chat_id=msg.chat.id, message_id=msg.message_id)
+    link = upload_to_gdrive(output_file)
 
-if name == "main":
-    main()
+    bot.edit_message_text(f"✅ Done!\nHere’s your converted file:\n{link}", chat_id=msg.chat.id, message_id=msg.message_id)
+
+bot.polling()
